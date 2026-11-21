@@ -1,0 +1,1812 @@
+name: Android Build
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Generate project files
+        run: |
+          set -e
+          mkdir -p "app"
+          cat > "app/build.gradle.kts" <<'LOS_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+
+          android {
+              namespace = "com.example.liveoverlaystudio"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.example.liveoverlaystudio"
+                  minSdk = 26
+                  targetSdk = 35
+                  versionCode = 2
+                  versionName = "0.2.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              buildFeatures {
+                  compose = true
+              }
+
+              packaging {
+                  resources {
+                      excludes += "/META-INF/{AL2.0,LGPL2.1}"
+                  }
+              }
+          }
+
+          kotlin {
+              compilerOptions {
+                  jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+              }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.12.01"))
+              implementation("androidx.activity:activity-compose:1.10.0")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.ui:ui-tooling-preview")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.material:material-icons-core")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+              debugImplementation("androidx.compose.ui:ui-tooling")
+          }
+          LOS_EOF
+          mkdir -p "app/src/main"
+          cat > "app/src/main/AndroidManifest.xml" <<'LOS_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:allowBackup="true"
+                  android:label="Live Overlay Studio"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+
+          </manifest>
+          LOS_EOF
+          mkdir -p "app/src/main/java/com/example/liveoverlaystudio"
+          cat > "app/src/main/java/com/example/liveoverlaystudio/MainActivity.kt" <<'LOS_EOF'
+          package com.example.liveoverlaystudio
+
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.activity.enableEdgeToEdge
+          import androidx.lifecycle.ViewModelProvider
+          import com.example.liveoverlaystudio.ui.LiveOverlayTheme
+          import com.example.liveoverlaystudio.ui.OverlayApp
+          import com.example.liveoverlaystudio.ui.OverlayViewModel
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  enableEdgeToEdge()
+                  val viewModel = ViewModelProvider(this)[OverlayViewModel::class.java]
+                  setContent {
+                      LiveOverlayTheme {
+                          OverlayApp(viewModel)
+                      }
+                  }
+              }
+          }
+          LOS_EOF
+          mkdir -p "app/src/main/java/com/example/liveoverlaystudio/data"
+          cat > "app/src/main/java/com/example/liveoverlaystudio/data/OverlayRepository.kt" <<'LOS_EOF'
+          package com.example.liveoverlaystudio.data
+
+          import android.content.Context
+          import android.content.SharedPreferences
+          import com.example.liveoverlaystudio.model.AppSettings
+          import com.example.liveoverlaystudio.model.DEFAULT_TICKER_TEXT
+          import com.example.liveoverlaystudio.model.Limits
+          import com.example.liveoverlaystudio.model.Sticker
+          import com.example.liveoverlaystudio.model.StickerKind
+          import com.example.liveoverlaystudio.model.TickerConfig
+          import com.example.liveoverlaystudio.model.Validation
+          import com.example.liveoverlaystudio.model.defaultStickers
+          import org.json.JSONArray
+          import org.json.JSONException
+          import org.json.JSONObject
+
+          /**
+           * Lưu và đọc cấu hình trên thiết bị bằng SharedPreferences.
+           * Dữ liệu hỏng sẽ được bỏ qua hoặc thay bằng giá trị mặc định, không gây crash.
+           */
+          class OverlayRepository(context: Context) {
+
+              private val prefs: SharedPreferences =
+                  context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+              class LoadedStickers(val stickers: List<Sticker>, val warning: String?)
+
+              fun loadStickers(): LoadedStickers {
+                  val raw: String? = try {
+                      prefs.getString(KEY_STICKERS, null)
+                  } catch (e: ClassCastException) {
+                      null
+                  }
+                  if (raw == null) return LoadedStickers(defaultStickers, null)
+
+                  return try {
+                      val array = JSONArray(raw)
+                      val result = ArrayList<Sticker>()
+                      val seenIds = HashSet<Int>()
+                      var skipped = 0
+                      for (i in 0 until array.length()) {
+                          val sticker = parseSticker(array.optJSONObject(i))
+                          if (sticker != null && seenIds.add(sticker.id)) {
+                              result.add(sticker)
+                          } else {
+                              skipped++
+                          }
+                      }
+                      val warning = if (skipped > 0) {
+                          "Đã bỏ qua $skipped sticker bị lỗi trong dữ liệu đã lưu."
+                      } else {
+                          null
+                      }
+                      LoadedStickers(result.take(Limits.MAX_STICKERS), warning)
+                  } catch (e: JSONException) {
+                      LoadedStickers(
+                          defaultStickers,
+                          "Dữ liệu sticker đã lưu bị hỏng, đã khôi phục 10 sticker mẫu."
+                      )
+                  }
+              }
+
+              private fun parseSticker(o: JSONObject?): Sticker? {
+                  if (o == null) return null
+                  return try {
+                      val text = Validation.cleanLine(o.getString("text")).take(Limits.MAX_STICKER_TEXT)
+                      if (text.isEmpty()) return null
+                      val emoji = Validation.cleanLine(o.optString("emoji", "✨"))
+                          .take(Limits.MAX_EMOJI)
+                          .ifEmpty { "✨" }
+                      Sticker(
+                          id = o.getInt("id"),
+                          text = text,
+                          emoji = emoji,
+                          kind = StickerKind.fromName(o.optString("kind", "FADE")),
+                          enabled = o.optBoolean("enabled", true)
+                      )
+                  } catch (e: JSONException) {
+                      null
+                  }
+              }
+
+              fun saveStickers(stickers: List<Sticker>): Boolean = try {
+                  val array = JSONArray()
+                  stickers.forEach { s ->
+                      array.put(
+                          JSONObject()
+                              .put("id", s.id)
+                              .put("text", s.text)
+                              .put("emoji", s.emoji)
+                              .put("kind", s.kind.name)
+                              .put("enabled", s.enabled)
+                      )
+                  }
+                  prefs.edit().putString(KEY_STICKERS, array.toString()).apply()
+                  true
+              } catch (e: Exception) {
+                  false
+              }
+
+              fun loadTicker(): TickerConfig = try {
+                  val text = Validation.cleanLine(prefs.getString(KEY_TICKER_TEXT, DEFAULT_TICKER_TEXT) ?: "")
+                      .take(Limits.MAX_TICKER_TEXT)
+                  TickerConfig(
+                      text = text.ifEmpty { DEFAULT_TICKER_TEXT },
+                      enabled = prefs.getBoolean(KEY_TICKER_ENABLED, true)
+                  )
+              } catch (e: ClassCastException) {
+                  TickerConfig()
+              }
+
+              fun saveTicker(ticker: TickerConfig): Boolean = try {
+                  prefs.edit()
+                      .putString(KEY_TICKER_TEXT, ticker.text)
+                      .putBoolean(KEY_TICKER_ENABLED, ticker.enabled)
+                      .apply()
+                  true
+              } catch (e: Exception) {
+                  false
+              }
+
+              fun loadSettings(): AppSettings = try {
+                  AppSettings(
+                      overlayEnabled = prefs.getBoolean(KEY_OVERLAY_ENABLED, true),
+                      autoRotate = prefs.getBoolean(KEY_AUTO_ROTATE, true),
+                      rotateSeconds = prefs.getInt(KEY_ROTATE_SECONDS, Limits.DEFAULT_ROTATE_SECONDS)
+                          .coerceIn(Limits.MIN_ROTATE_SECONDS, Limits.MAX_ROTATE_SECONDS)
+                  )
+              } catch (e: ClassCastException) {
+                  AppSettings()
+              }
+
+              fun saveSettings(settings: AppSettings): Boolean = try {
+                  prefs.edit()
+                      .putBoolean(KEY_OVERLAY_ENABLED, settings.overlayEnabled)
+                      .putBoolean(KEY_AUTO_ROTATE, settings.autoRotate)
+                      .putInt(KEY_ROTATE_SECONDS, settings.rotateSeconds)
+                      .apply()
+                  true
+              } catch (e: Exception) {
+                  false
+              }
+
+              fun loadVideoUri(): String? = try {
+                  prefs.getString(KEY_VIDEO_URI, null)
+              } catch (e: ClassCastException) {
+                  null
+              }
+
+              fun saveVideoUri(uri: String?): Boolean = try {
+                  val editor = prefs.edit()
+                  if (uri == null) editor.remove(KEY_VIDEO_URI) else editor.putString(KEY_VIDEO_URI, uri)
+                  editor.apply()
+                  true
+              } catch (e: Exception) {
+                  false
+              }
+
+              fun clearAll(): Boolean = try {
+                  prefs.edit().clear().apply()
+                  true
+              } catch (e: Exception) {
+                  false
+              }
+
+              private companion object {
+                  const val PREFS_NAME = "overlay_prefs"
+                  const val KEY_STICKERS = "stickers"
+                  const val KEY_TICKER_TEXT = "ticker_text"
+                  const val KEY_TICKER_ENABLED = "ticker"
+                  const val KEY_OVERLAY_ENABLED = "mixed_enabled"
+                  const val KEY_AUTO_ROTATE = "auto_rotate"
+                  const val KEY_ROTATE_SECONDS = "rotate_seconds"
+                  const val KEY_VIDEO_URI = "video_uri"
+              }
+          }
+          LOS_EOF
+          mkdir -p "app/src/main/java/com/example/liveoverlaystudio/model"
+          cat > "app/src/main/java/com/example/liveoverlaystudio/model/Models.kt" <<'LOS_EOF'
+          package com.example.liveoverlaystudio.model
+
+          const val DEFAULT_TICKER_TEXT = "Thông tin sản phẩm và ưu đãi chính thức"
+
+          object Limits {
+              const val MAX_STICKERS = 50
+              const val MAX_STICKER_TEXT = 60
+              const val MAX_EMOJI = 12
+              const val MAX_TICKER_TEXT = 200
+              const val MIN_ROTATE_SECONDS = 2
+              const val MAX_ROTATE_SECONDS = 15
+              const val DEFAULT_ROTATE_SECONDS = 4
+          }
+
+          enum class StickerKind(val label: String) {
+              PULSE("Nhấp nháy"),
+              FADE("Mờ dần"),
+              SLIDE("Trượt"),
+              MARQUEE("Chạy ngang"),
+              ZOOM("Phóng to");
+
+              companion object {
+                  fun fromName(name: String?): StickerKind =
+                      entries.firstOrNull { it.name == name } ?: FADE
+              }
+          }
+
+          data class Sticker(
+              val id: Int,
+              val text: String,
+              val emoji: String,
+              val kind: StickerKind = StickerKind.FADE,
+              val enabled: Boolean = true
+          )
+
+          data class TickerConfig(
+              val text: String = DEFAULT_TICKER_TEXT,
+              val enabled: Boolean = true
+          )
+
+          data class AppSettings(
+              val overlayEnabled: Boolean = true,
+              val autoRotate: Boolean = true,
+              val rotateSeconds: Int = Limits.DEFAULT_ROTATE_SECONDS
+          )
+
+          val defaultStickers: List<Sticker> = listOf(
+              Sticker(1, "DEAL HOT HÔM NAY", "🔥", StickerKind.PULSE),
+              Sticker(2, "ƯU ĐÃI ĐẶC BIỆT", "🎁", StickerKind.FADE),
+              Sticker(3, "XEM SẢN PHẨM", "🛒", StickerKind.SLIDE),
+              Sticker(4, "ƯU ĐÃI ĐANG DIỄN RA", "⚡", StickerKind.MARQUEE),
+              Sticker(5, "CẢM ƠN ĐÃ GHÉ XEM", "❤️", StickerKind.FADE),
+              Sticker(6, "SẢN PHẨM NỔI BẬT", "🎉", StickerKind.ZOOM),
+              Sticker(7, "XEM CHI TIẾT SẢN PHẨM", "💥", StickerKind.SLIDE),
+              Sticker(8, "GIÁ VÀ ƯU ĐÃI", "🏷️", StickerKind.FADE),
+              Sticker(9, "THÔNG TIN SẢN PHẨM", "📦", StickerKind.SLIDE),
+              Sticker(10, "KHÁM PHÁ DANH MỤC", "🛍️", StickerKind.MARQUEE)
+          )
+
+          /** Kiểm tra dữ liệu người dùng nhập. Trả về null nếu hợp lệ, hoặc thông báo lỗi tiếng Việt. */
+          object Validation {
+
+              fun cleanLine(raw: String): String =
+                  raw.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ').trim()
+
+              fun stickerError(text: String, emoji: String): String? {
+                  val t = cleanLine(text)
+                  val e = cleanLine(emoji)
+                  return when {
+                      t.isEmpty() -> "Nội dung sticker không được để trống."
+                      t.length > Limits.MAX_STICKER_TEXT ->
+                          "Nội dung sticker tối đa ${Limits.MAX_STICKER_TEXT} ký tự (hiện có ${t.length})."
+                      e.length > Limits.MAX_EMOJI ->
+                          "Emoji tối đa ${Limits.MAX_EMOJI} ký tự. Hãy chỉ nhập 1 biểu tượng."
+                      else -> null
+                  }
+              }
+
+              fun tickerError(text: String): String? {
+                  val t = cleanLine(text)
+                  return when {
+                      t.isEmpty() ->
+                          "Dòng chữ chạy không được để trống. Hãy tắt dòng chữ chạy nếu bạn không cần."
+                      t.length > Limits.MAX_TICKER_TEXT ->
+                          "Dòng chữ chạy tối đa ${Limits.MAX_TICKER_TEXT} ký tự (hiện có ${t.length})."
+                      else -> null
+                  }
+              }
+          }
+          LOS_EOF
+          mkdir -p "app/src/main/java/com/example/liveoverlaystudio/ui"
+          cat > "app/src/main/java/com/example/liveoverlaystudio/ui/Components.kt" <<'LOS_EOF'
+          package com.example.liveoverlaystudio.ui
+
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.material3.AlertDialog
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.Switch
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.runtime.Composable
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.text.font.FontWeight
+
+          @Composable
+          fun SectionTitle(text: String) {
+              Text(text, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+          }
+
+          @Composable
+          fun SettingSwitch(
+              label: String,
+              checked: Boolean,
+              enabled: Boolean = true,
+              onChecked: (Boolean) -> Unit
+          ) {
+              Row(
+                  modifier = Modifier.fillMaxWidth(),
+                  verticalAlignment = Alignment.CenterVertically,
+                  horizontalArrangement = Arrangement.SpaceBetween
+              ) {
+                  Text(label, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                  Switch(checked = checked, onCheckedChange = onChecked, enabled = enabled)
+              }
+          }
+
+          @Composable
+          fun ConfirmDialog(
+              title: String,
+              message: String,
+              confirmLabel: String,
+              onConfirm: () -> Unit,
+              onDismiss: () -> Unit
+          ) {
+              AlertDialog(
+                  onDismissRequest = onDismiss,
+                  title = { Text(title) },
+                  text = { Text(message) },
+                  confirmButton = {
+                      TextButton(onClick = {
+                          onConfirm()
+                          onDismiss()
+                      }) { Text(confirmLabel) }
+                  },
+                  dismissButton = { TextButton(onClick = onDismiss) { Text("Hủy") } }
+              )
+          }
+          LOS_EOF
+          mkdir -p "app/src/main/java/com/example/liveoverlaystudio/ui"
+          cat > "app/src/main/java/com/example/liveoverlaystudio/ui/OverlayApp.kt" <<'LOS_EOF'
+          package com.example.liveoverlaystudio.ui
+
+          import androidx.activity.compose.BackHandler
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.imePadding
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.statusBarsPadding
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.Info
+          import androidx.compose.material.icons.filled.PlayArrow
+          import androidx.compose.material.icons.filled.Settings
+          import androidx.compose.material.icons.filled.Star
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.NavigationBar
+          import androidx.compose.material3.NavigationBarItem
+          import androidx.compose.material3.Scaffold
+          import androidx.compose.material3.SnackbarDuration
+          import androidx.compose.material3.SnackbarHost
+          import androidx.compose.material3.SnackbarHostState
+          import androidx.compose.material3.Surface
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.saveable.rememberSaveable
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.vector.ImageVector
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+
+          private enum class Tab(val title: String, val icon: ImageVector) {
+              STUDIO("Studio", Icons.Default.PlayArrow),
+              STICKERS("Sticker", Icons.Default.Star),
+              SETTINGS("Cài đặt", Icons.Default.Settings),
+              ABOUT("Thông tin", Icons.Default.Info)
+          }
+
+          @Composable
+          fun OverlayApp(vm: OverlayViewModel) {
+              var tabIndex by rememberSaveable { mutableStateOf(0) }
+              val snackbarHostState = remember { SnackbarHostState() }
+              val message = vm.message
+
+              LaunchedEffect(message) {
+                  if (message != null) {
+                      snackbarHostState.showSnackbar(
+                          message = message.text,
+                          withDismissAction = true,
+                          duration = if (message.isError) SnackbarDuration.Long else SnackbarDuration.Short
+                      )
+                      vm.consumeMessage(message.id)
+                  }
+              }
+
+              LaunchedEffect(vm.videoUri) { vm.loadVideoFrame() }
+
+              BackHandler(enabled = tabIndex != 0) { tabIndex = 0 }
+
+              Scaffold(
+                  modifier = Modifier.imePadding(),
+                  topBar = { AppHeader() },
+                  bottomBar = {
+                      NavigationBar {
+                          Tab.entries.forEachIndexed { i, tab ->
+                              NavigationBarItem(
+                                  selected = tabIndex == i,
+                                  onClick = { tabIndex = i },
+                                  icon = { Icon(tab.icon, contentDescription = null) },
+                                  label = { Text(tab.title) }
+                              )
+                          }
+                      }
+                  },
+                  snackbarHost = { SnackbarHost(snackbarHostState) }
+              ) { padding ->
+                  val contentModifier = Modifier.padding(padding)
+                  when (tabIndex) {
+                      0 -> StudioScreen(vm, contentModifier)
+                      1 -> StickersScreen(vm, contentModifier)
+                      2 -> SettingsScreen(vm, contentModifier)
+                      else -> AboutScreen(contentModifier)
+                  }
+              }
+          }
+
+          @Composable
+          private fun AppHeader() {
+              Surface(tonalElevation = 2.dp) {
+                  Column(
+                      Modifier
+                          .fillMaxWidth()
+                          .statusBarsPadding()
+                          .padding(horizontal = 18.dp, vertical = 12.dp)
+                  ) {
+                      Text("LIVE OVERLAY STUDIO", fontWeight = FontWeight.ExtraBold, letterSpacing = 1.sp)
+                      Text(
+                          "Xem trước 16:9 • Dữ liệu lưu trên thiết bị",
+                          style = MaterialTheme.typography.bodySmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant
+                      )
+                  }
+              }
+          }
+          LOS_EOF
+          mkdir -p "app/src/main/java/com/example/liveoverlaystudio/ui"
+          cat > "app/src/main/java/com/example/liveoverlaystudio/ui/OverlayViewModel.kt" <<'LOS_EOF'
+          package com.example.liveoverlaystudio.ui
+
+          import android.app.Application
+          import android.content.Intent
+          import android.graphics.Bitmap
+          import android.net.Uri
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.setValue
+          import androidx.lifecycle.AndroidViewModel
+          import com.example.liveoverlaystudio.data.OverlayRepository
+          import com.example.liveoverlaystudio.model.AppSettings
+          import com.example.liveoverlaystudio.model.Limits
+          import com.example.liveoverlaystudio.model.Sticker
+          import com.example.liveoverlaystudio.model.StickerKind
+          import com.example.liveoverlaystudio.model.TickerConfig
+          import com.example.liveoverlaystudio.model.Validation
+          import com.example.liveoverlaystudio.model.defaultStickers
+          import com.example.liveoverlaystudio.video.LocalVideoSource
+
+          data class UiMessage(val text: String, val isError: Boolean, val id: Long)
+
+          class OverlayViewModel(application: Application) : AndroidViewModel(application) {
+
+              private val repo = OverlayRepository(application)
+
+              var stickers by mutableStateOf<List<Sticker>>(emptyList())
+                  private set
+              var ticker by mutableStateOf(TickerConfig())
+                  private set
+              var settings by mutableStateOf(AppSettings())
+                  private set
+              var videoUri by mutableStateOf<String?>(null)
+                  private set
+              var videoName by mutableStateOf<String?>(null)
+                  private set
+              var videoFrame by mutableStateOf<Bitmap?>(null)
+                  private set
+              var previewRunning by mutableStateOf(false)
+                  private set
+              var message by mutableStateOf<UiMessage?>(null)
+                  private set
+
+              init {
+                  val loaded = repo.loadStickers()
+                  stickers = loaded.stickers
+                  ticker = repo.loadTicker()
+                  settings = repo.loadSettings()
+                  videoUri = repo.loadVideoUri()
+                  val warning = loaded.warning
+                  if (warning != null) post(warning, true)
+              }
+
+              // ---------- Thông báo ----------
+
+              private fun post(text: String, isError: Boolean) {
+                  message = UiMessage(text, isError, System.nanoTime())
+              }
+
+              fun showError(text: String) {
+                  post(text, true)
+              }
+
+              fun consumeMessage(id: Long) {
+                  if (message?.id == id) message = null
+              }
+
+              // ---------- Sticker ----------
+
+              private fun nextId(): Int = (stickers.maxOfOrNull { it.id } ?: 0) + 1
+
+              private fun persistStickers() {
+                  if (!repo.saveStickers(stickers)) post("Không lưu được danh sách sticker.", true)
+              }
+
+              /** Trả về null nếu thành công, hoặc thông báo lỗi để hiển thị trong hộp thoại. */
+              fun addSticker(text: String, emoji: String, kind: StickerKind): String? {
+                  val error = Validation.stickerError(text, emoji)
+                  if (error != null) return error
+                  if (stickers.size >= Limits.MAX_STICKERS) {
+                      return "Đã đạt tối đa ${Limits.MAX_STICKERS} sticker. Hãy xóa bớt trước khi thêm."
+                  }
+                  val cleanEmoji = Validation.cleanLine(emoji).ifEmpty { "✨" }
+                  stickers = stickers + Sticker(nextId(), Validation.cleanLine(text), cleanEmoji, kind)
+                  persistStickers()
+                  post("Đã thêm sticker.", false)
+                  return null
+              }
+
+              fun updateSticker(id: Int, text: String, emoji: String, kind: StickerKind): String? {
+                  val error = Validation.stickerError(text, emoji)
+                  if (error != null) return error
+                  if (stickers.none { it.id == id }) return "Không tìm thấy sticker này (có thể đã bị xóa)."
+                  val cleanText = Validation.cleanLine(text)
+                  val cleanEmoji = Validation.cleanLine(emoji).ifEmpty { "✨" }
+                  stickers = stickers.map {
+                      if (it.id == id) it.copy(text = cleanText, emoji = cleanEmoji, kind = kind) else it
+                  }
+                  persistStickers()
+                  post("Đã lưu sticker.", false)
+                  return null
+              }
+
+              fun setStickerEnabled(id: Int, enabled: Boolean) {
+                  stickers = stickers.map { if (it.id == id) it.copy(enabled = enabled) else it }
+                  persistStickers()
+              }
+
+              fun deleteSticker(id: Int) {
+                  stickers = stickers.filterNot { it.id == id }
+                  persistStickers()
+                  post("Đã xóa sticker.", false)
+              }
+
+              fun restoreDefaultStickers() {
+                  stickers = defaultStickers
+                  persistStickers()
+                  post("Đã khôi phục 10 sticker mẫu.", false)
+              }
+
+              // ---------- Dòng chữ chạy ----------
+
+              fun setTickerText(text: String): String? {
+                  val error = Validation.tickerError(text)
+                  if (error != null) return error
+                  ticker = ticker.copy(text = Validation.cleanLine(text))
+                  if (repo.saveTicker(ticker)) {
+                      post("Đã lưu dòng chữ chạy.", false)
+                  } else {
+                      post("Không lưu được dòng chữ chạy.", true)
+                  }
+                  return null
+              }
+
+              fun setTickerEnabled(enabled: Boolean) {
+                  ticker = ticker.copy(enabled = enabled)
+                  if (!repo.saveTicker(ticker)) post("Không lưu được cài đặt dòng chữ chạy.", true)
+              }
+
+              // ---------- Cài đặt ----------
+
+              private fun updateSettings(newSettings: AppSettings) {
+                  settings = newSettings
+                  if (!repo.saveSettings(newSettings)) post("Không lưu được cài đặt.", true)
+              }
+
+              fun setOverlayEnabled(enabled: Boolean) {
+                  updateSettings(settings.copy(overlayEnabled = enabled))
+              }
+
+              fun setAutoRotate(enabled: Boolean) {
+                  updateSettings(settings.copy(autoRotate = enabled))
+              }
+
+              fun setRotateSeconds(seconds: Int) {
+                  val safe = seconds.coerceIn(Limits.MIN_ROTATE_SECONDS, Limits.MAX_ROTATE_SECONDS)
+                  updateSettings(settings.copy(rotateSeconds = safe))
+              }
+
+              fun resetAll() {
+                  repo.clearAll()
+                  stickers = defaultStickers
+                  ticker = TickerConfig()
+                  settings = AppSettings()
+                  videoUri = null
+                  videoName = null
+                  videoFrame = null
+                  previewRunning = false
+                  post("Đã khôi phục toàn bộ cài đặt mặc định.", false)
+              }
+
+              // ---------- Preview và video cục bộ ----------
+
+              fun togglePreview() {
+                  previewRunning = !previewRunning
+              }
+
+              fun onVideoPicked(uri: Uri) {
+                  try {
+                      getApplication<Application>().contentResolver
+                          .takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                  } catch (e: Exception) {
+                      // Không giữ được quyền lâu dài: video vẫn dùng được trong phiên này.
+                  }
+                  val value = uri.toString()
+                  videoUri = value
+                  repo.saveVideoUri(value)
+              }
+
+              fun clearVideo() {
+                  videoUri = null
+                  videoName = null
+                  videoFrame = null
+                  repo.saveVideoUri(null)
+              }
+
+              /** Gọi từ LaunchedEffect mỗi khi videoUri đổi. */
+              suspend fun loadVideoFrame() {
+                  val raw = videoUri
+                  if (raw == null) {
+                      videoFrame = null
+                      videoName = null
+                      return
+                  }
+                  val context = getApplication<Application>()
+                  val source = LocalVideoSource(Uri.parse(raw))
+                  videoName = source.displayName(context)
+                  val result = source.loadPreviewFrame(context)
+                  val frame = result.getOrNull()
+                  if (frame != null) {
+                      videoFrame = frame
+                  } else {
+                      val reason = result.exceptionOrNull()?.message ?: "lỗi không xác định"
+                      clearVideo()
+                      post("Không mở được video đã chọn ($reason). Vui lòng chọn video khác.", true)
+                  }
+              }
+          }
+          LOS_EOF
+          mkdir -p "app/src/main/java/com/example/liveoverlaystudio/ui"
+          cat > "app/src/main/java/com/example/liveoverlaystudio/ui/PreviewPanel.kt" <<'LOS_EOF'
+          package com.example.liveoverlaystudio.ui
+
+          import android.graphics.Bitmap
+          import androidx.compose.animation.Crossfade
+          import androidx.compose.animation.core.RepeatMode
+          import androidx.compose.animation.core.animateFloat
+          import androidx.compose.animation.core.infiniteRepeatable
+          import androidx.compose.animation.core.rememberInfiniteTransition
+          import androidx.compose.animation.core.tween
+          import androidx.compose.foundation.ExperimentalFoundationApi
+          import androidx.compose.foundation.Image
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.basicMarquee
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.aspectRatio
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.Card
+          import androidx.compose.material3.Surface
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableIntStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.asImageBitmap
+          import androidx.compose.ui.graphics.graphicsLayer
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import com.example.liveoverlaystudio.model.AppSettings
+          import com.example.liveoverlaystudio.model.Sticker
+          import com.example.liveoverlaystudio.model.StickerKind
+          import com.example.liveoverlaystudio.model.TickerConfig
+          import kotlinx.coroutines.delay
+
+          /** Vùng xem trước tỷ lệ 16:9 (mục tiêu 1280x720). Đây là bản xem trước giao diện, không phải trình ghép video. */
+          @Composable
+          fun PreviewPanel(
+              stickers: List<Sticker>,
+              settings: AppSettings,
+              ticker: TickerConfig,
+              running: Boolean,
+              frame: Bitmap?,
+              modifier: Modifier = Modifier
+          ) {
+              val active = stickers.filter { it.enabled }
+              var index by remember { mutableIntStateOf(0) }
+
+              LaunchedEffect(running, settings.autoRotate, settings.rotateSeconds, active.size) {
+                  if (running && settings.autoRotate && active.size > 1) {
+                      while (true) {
+                          delay(settings.rotateSeconds * 1000L)
+                          index = (index + 1) % active.size
+                      }
+                  }
+              }
+              val current: Sticker? = if (active.isEmpty()) null else active[index % active.size]
+
+              Card(shape = RoundedCornerShape(16.dp), modifier = modifier.fillMaxWidth()) {
+                  Box(
+                      Modifier
+                          .fillMaxWidth()
+                          .aspectRatio(16f / 9f)
+                          .background(Color(0xFF111827))
+                  ) {
+                      if (frame != null) {
+                          Image(
+                              bitmap = frame.asImageBitmap(),
+                              contentDescription = "Khung hình video",
+                              contentScale = ContentScale.Crop,
+                              modifier = Modifier.fillMaxSize()
+                          )
+                      } else {
+                          Column(
+                              Modifier.fillMaxSize(),
+                              verticalArrangement = Arrangement.Center,
+                              horizontalAlignment = Alignment.CenterHorizontally
+                          ) {
+                              Text("▶", fontSize = 36.sp, color = Color(0xFF9EA6B8))
+                              Text(
+                                  "VÙNG XEM TRƯỚC 16:9",
+                                  color = Color.White,
+                                  fontWeight = FontWeight.SemiBold,
+                                  fontSize = 12.sp
+                              )
+                              Text(
+                                  "Chọn video của bạn để làm nền",
+                                  color = Color(0xFFB8BECA),
+                                  fontSize = 10.sp
+                              )
+                          }
+                      }
+
+                      Row(
+                          Modifier
+                              .fillMaxWidth()
+                              .align(Alignment.TopCenter)
+                              .padding(8.dp),
+                          horizontalArrangement = Arrangement.SpaceBetween
+                      ) {
+                          LabelChip("PREVIEW • 1280×720", Color(0xFFD32F2F))
+                          LabelChip(
+                              if (running) "ĐANG CHẠY" else "TẠM DỪNG",
+                              if (running) Color(0xFF2E7D32) else Color(0xFF616161)
+                          )
+                      }
+
+                      if (settings.overlayEnabled) {
+                          Column(
+                              Modifier
+                                  .align(Alignment.BottomCenter)
+                                  .fillMaxWidth()
+                                  .padding(8.dp)
+                          ) {
+                              current?.let { shownSticker ->
+                                  Crossfade(targetState = shownSticker, label = "sticker") { s ->
+                                      StickerBadge(s, running)
+                                  }
+                              }
+                              if (ticker.enabled && ticker.text.isNotEmpty()) {
+                                  Spacer(Modifier.height(6.dp))
+                                  TickerBar(ticker.text, running)
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun LabelChip(text: String, color: Color) {
+              Surface(color = color, shape = RoundedCornerShape(50)) {
+                  Text(
+                      text,
+                      Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                      color = Color.White,
+                      fontSize = 9.sp,
+                      fontWeight = FontWeight.Bold
+                  )
+              }
+          }
+
+          @OptIn(ExperimentalFoundationApi::class)
+          @Composable
+          private fun StickerBadge(sticker: Sticker, running: Boolean) {
+              val transition = rememberInfiniteTransition(label = "sticker")
+              val pulse by transition.animateFloat(
+                  initialValue = 0.7f,
+                  targetValue = 1f,
+                  animationSpec = infiniteRepeatable(tween(700), RepeatMode.Reverse),
+                  label = "pulse"
+              )
+              val slow by transition.animateFloat(
+                  initialValue = 0.5f,
+                  targetValue = 1f,
+                  animationSpec = infiniteRepeatable(tween(1600), RepeatMode.Reverse),
+                  label = "slow"
+              )
+              val shift by transition.animateFloat(
+                  initialValue = -10f,
+                  targetValue = 10f,
+                  animationSpec = infiniteRepeatable(tween(1200), RepeatMode.Reverse),
+                  label = "shift"
+              )
+              val zoom by transition.animateFloat(
+                  initialValue = 0.94f,
+                  targetValue = 1.05f,
+                  animationSpec = infiniteRepeatable(tween(900), RepeatMode.Reverse),
+                  label = "zoom"
+              )
+
+              val label = if (sticker.kind == StickerKind.MARQUEE && running) {
+                  ("${sticker.emoji}  ${sticker.text}      ").repeat(4)
+              } else {
+                  "${sticker.emoji}  ${sticker.text}"
+              }
+
+              Surface(
+                  color = Color(0xFFE53935),
+                  shape = RoundedCornerShape(10.dp),
+                  modifier = Modifier
+                      .fillMaxWidth(0.8f)
+                      .graphicsLayer {
+                          if (running) {
+                              when (sticker.kind) {
+                                  StickerKind.PULSE -> alpha = pulse
+                                  StickerKind.FADE -> alpha = slow
+                                  StickerKind.SLIDE -> translationX = shift * density
+                                  StickerKind.ZOOM -> {
+                                      scaleX = zoom
+                                      scaleY = zoom
+                                  }
+                                  StickerKind.MARQUEE -> Unit
+                              }
+                          }
+                      }
+              ) {
+                  val base = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                  Text(
+                      text = label,
+                      modifier = if (sticker.kind == StickerKind.MARQUEE && running) {
+                          base.fillMaxWidth().basicMarquee(iterations = Int.MAX_VALUE)
+                      } else {
+                          base
+                      },
+                      color = Color.White,
+                      fontWeight = FontWeight.Bold,
+                      fontSize = 13.sp,
+                      maxLines = 1,
+                      softWrap = false,
+                      overflow = TextOverflow.Ellipsis
+                  )
+              }
+          }
+
+          @OptIn(ExperimentalFoundationApi::class)
+          @Composable
+          private fun TickerBar(text: String, running: Boolean) {
+              val shown = if (running) (text + "      •      ").repeat(4) else text
+              Surface(color = Color(0xCC000000), shape = RoundedCornerShape(6.dp)) {
+                  val base = Modifier
+                      .fillMaxWidth()
+                      .padding(horizontal = 8.dp, vertical = 5.dp)
+                  Text(
+                      text = shown,
+                      modifier = if (running) base.basicMarquee(iterations = Int.MAX_VALUE) else base,
+                      color = Color.White,
+                      fontSize = 11.sp,
+                      maxLines = 1,
+                      softWrap = false,
+                      overflow = TextOverflow.Ellipsis
+                  )
+              }
+          }
+          LOS_EOF
+          mkdir -p "app/src/main/java/com/example/liveoverlaystudio/ui"
+          cat > "app/src/main/java/com/example/liveoverlaystudio/ui/SettingsScreen.kt" <<'LOS_EOF'
+          package com.example.liveoverlaystudio.ui
+
+          import android.content.Context
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.PaddingValues
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.material3.Card
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.OutlinedButton
+          import androidx.compose.material3.Slider
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableFloatStateOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import com.example.liveoverlaystudio.model.Limits
+          import kotlin.math.roundToInt
+
+          @Composable
+          fun SettingsScreen(vm: OverlayViewModel, modifier: Modifier = Modifier) {
+              var confirmReset by remember { mutableStateOf(false) }
+              var sliderValue by remember(vm.settings.rotateSeconds) {
+                  mutableFloatStateOf(vm.settings.rotateSeconds.toFloat())
+              }
+
+              LazyColumn(
+                  modifier = modifier
+                      .fillMaxSize()
+                      .padding(horizontal = 16.dp),
+                  verticalArrangement = Arrangement.spacedBy(14.dp),
+                  contentPadding = PaddingValues(vertical = 12.dp)
+              ) {
+                  item {
+                      Card(Modifier.fillMaxWidth()) {
+                          Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                              SectionTitle("Lớp overlay")
+                              SettingSwitch("Bật lớp overlay", vm.settings.overlayEnabled) {
+                                  vm.setOverlayEnabled(it)
+                              }
+                              SettingSwitch("Tự động luân phiên sticker", vm.settings.autoRotate) {
+                                  vm.setAutoRotate(it)
+                              }
+                              Text(
+                                  "Đổi sticker sau mỗi ${sliderValue.roundToInt()} giây",
+                                  style = MaterialTheme.typography.bodyMedium
+                              )
+                              Slider(
+                                  value = sliderValue,
+                                  onValueChange = { sliderValue = it },
+                                  onValueChangeFinished = { vm.setRotateSeconds(sliderValue.roundToInt()) },
+                                  valueRange = Limits.MIN_ROTATE_SECONDS.toFloat()..Limits.MAX_ROTATE_SECONDS.toFloat(),
+                                  steps = Limits.MAX_ROTATE_SECONDS - Limits.MIN_ROTATE_SECONDS - 1,
+                                  enabled = vm.settings.autoRotate
+                              )
+                          }
+                      }
+                  }
+                  item {
+                      Card(Modifier.fillMaxWidth()) {
+                          Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                              SectionTitle("Thông số")
+                              Text("Độ phân giải mục tiêu: 1280 × 720 (16:9)", style = MaterialTheme.typography.bodyMedium)
+                              Text("Dữ liệu được lưu ngay trên thiết bị này.", style = MaterialTheme.typography.bodyMedium)
+                          }
+                      }
+                  }
+                  item {
+                      Card(Modifier.fillMaxWidth()) {
+                          Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                              SectionTitle("Dữ liệu")
+                              Text(
+                                  "Xóa toàn bộ sticker, dòng chữ chạy, video đã chọn và cài đặt, rồi quay về mặc định.",
+                                  style = MaterialTheme.typography.bodySmall
+                              )
+                              OutlinedButton(
+                                  onClick = { confirmReset = true },
+                                  modifier = Modifier.fillMaxWidth()
+                              ) { Text("Khôi phục mặc định") }
+                          }
+                      }
+                  }
+              }
+
+              if (confirmReset) {
+                  ConfirmDialog(
+                      title = "Khôi phục mặc định?",
+                      message = "Mọi thay đổi của bạn sẽ bị xóa và không thể hoàn tác.",
+                      confirmLabel = "Khôi phục",
+                      onConfirm = { vm.resetAll() },
+                      onDismiss = { confirmReset = false }
+                  )
+              }
+          }
+
+          @Composable
+          fun AboutScreen(modifier: Modifier = Modifier) {
+              val context = LocalContext.current
+              val version = remember { readVersionName(context) }
+
+              LazyColumn(
+                  modifier = modifier
+                      .fillMaxSize()
+                      .padding(horizontal = 16.dp),
+                  verticalArrangement = Arrangement.spacedBy(14.dp),
+                  contentPadding = PaddingValues(vertical = 12.dp)
+              ) {
+                  item {
+                      Card(Modifier.fillMaxWidth()) {
+                          Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                              Text("Live Overlay Studio", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.ExtraBold)
+                              Text("Phiên bản $version", style = MaterialTheme.typography.bodyMedium)
+                              Text(
+                                  "Công cụ thiết kế và xem trước lớp overlay (sticker quảng cáo, dòng chữ chạy) " +
+                                      "cho nội dung do bạn sở hữu hoặc được phép sử dụng.",
+                                  style = MaterialTheme.typography.bodyMedium
+                              )
+                          }
+                      }
+                  }
+                  item {
+                      Card(Modifier.fillMaxWidth()) {
+                          Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                              SectionTitle("Đã có")
+                              Text("• Vùng xem trước 16:9 (mục tiêu 1280×720)")
+                              Text("• 10 sticker mẫu; thêm, sửa, xóa, bật/tắt")
+                              Text("• Chỉnh sửa dòng chữ chạy")
+                              Text("• Lưu cấu hình trên thiết bị")
+                              Text("• Chọn video cục bộ để xem khung hình đầu tiên làm nền")
+                          }
+                      }
+                  }
+                  item {
+                      Card(Modifier.fillMaxWidth()) {
+                          Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                              SectionTitle("Chưa có")
+                              Text("• Phát video và ghép overlay vào video thật")
+                              Text("• Phát livestream hoặc xuất RTMP")
+                              Text("• Lấy luồng TikTok LIVE, đăng nhập TikTok, gắn giỏ hàng")
+                              Text(
+                                  "Ứng dụng không hỗ trợ tải lại hay phát lại LIVE của người khác, " +
+                                      "và không được dùng để né kiểm duyệt hay bản quyền của nền tảng.",
+                                  style = MaterialTheme.typography.bodySmall,
+                                  color = MaterialTheme.colorScheme.onSurfaceVariant
+                              )
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Suppress("DEPRECATION")
+          private fun readVersionName(context: Context): String = try {
+              context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "?"
+          } catch (e: Exception) {
+              "?"
+          }
+          LOS_EOF
+          mkdir -p "app/src/main/java/com/example/liveoverlaystudio/ui"
+          cat > "app/src/main/java/com/example/liveoverlaystudio/ui/StickersScreen.kt" <<'LOS_EOF'
+          package com.example.liveoverlaystudio.ui
+
+          import androidx.compose.foundation.horizontalScroll
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.PaddingValues
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.Add
+          import androidx.compose.material.icons.filled.Delete
+          import androidx.compose.material.icons.filled.Edit
+          import androidx.compose.material3.AlertDialog
+          import androidx.compose.material3.Button
+          import androidx.compose.material3.Card
+          import androidx.compose.material3.FilterChip
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.IconButton
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.OutlinedButton
+          import androidx.compose.material3.OutlinedTextField
+          import androidx.compose.material3.Switch
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.alpha
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import com.example.liveoverlaystudio.model.Limits
+          import com.example.liveoverlaystudio.model.Sticker
+          import com.example.liveoverlaystudio.model.StickerKind
+
+          @Composable
+          fun StickersScreen(vm: OverlayViewModel, modifier: Modifier = Modifier) {
+              var showAdd by remember { mutableStateOf(false) }
+              var editing by remember { mutableStateOf<Sticker?>(null) }
+              var deleting by remember { mutableStateOf<Sticker?>(null) }
+              var confirmReset by remember { mutableStateOf(false) }
+
+              LazyColumn(
+                  modifier = modifier
+                      .fillMaxSize()
+                      .padding(horizontal = 16.dp),
+                  verticalArrangement = Arrangement.spacedBy(10.dp),
+                  contentPadding = PaddingValues(vertical = 12.dp)
+              ) {
+                  item {
+                      Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                          SectionTitle("Sticker quảng cáo")
+                          Text(
+                              "${vm.stickers.size}/${Limits.MAX_STICKERS} sticker • " +
+                                  "${vm.stickers.count { it.enabled }} đang bật",
+                              style = MaterialTheme.typography.bodySmall,
+                              color = MaterialTheme.colorScheme.onSurfaceVariant
+                          )
+                      }
+                  }
+                  item {
+                      Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                          Button(onClick = { showAdd = true }, modifier = Modifier.weight(1f)) {
+                              Icon(Icons.Default.Add, contentDescription = null)
+                              Text("Thêm")
+                          }
+                          OutlinedButton(onClick = { confirmReset = true }, modifier = Modifier.weight(1f)) {
+                              Text("Khôi phục 10 mẫu")
+                          }
+                      }
+                  }
+                  if (vm.stickers.isEmpty()) {
+                      item {
+                          Text(
+                              "Chưa có sticker nào. Bấm \"Thêm\" hoặc \"Khôi phục 10 mẫu\".",
+                              style = MaterialTheme.typography.bodyMedium
+                          )
+                      }
+                  }
+                  items(vm.stickers, key = { it.id }) { sticker ->
+                      StickerCard(
+                          sticker = sticker,
+                          onToggle = { vm.setStickerEnabled(sticker.id, it) },
+                          onEdit = { editing = sticker },
+                          onDelete = { deleting = sticker }
+                      )
+                  }
+              }
+
+              if (showAdd) {
+                  StickerDialog(
+                      title = "Thêm sticker",
+                      initial = null,
+                      onDismiss = { showAdd = false },
+                      onSubmit = { text, emoji, kind -> vm.addSticker(text, emoji, kind) }
+                  )
+              }
+              val editTarget = editing
+              if (editTarget != null) {
+                  StickerDialog(
+                      title = "Sửa sticker",
+                      initial = editTarget,
+                      onDismiss = { editing = null },
+                      onSubmit = { text, emoji, kind -> vm.updateSticker(editTarget.id, text, emoji, kind) }
+                  )
+              }
+              val deleteTarget = deleting
+              if (deleteTarget != null) {
+                  ConfirmDialog(
+                      title = "Xóa sticker?",
+                      message = "Xóa \"${deleteTarget.text}\"? Hành động này không thể hoàn tác.",
+                      confirmLabel = "Xóa",
+                      onConfirm = { vm.deleteSticker(deleteTarget.id) },
+                      onDismiss = { deleting = null }
+                  )
+              }
+              if (confirmReset) {
+                  ConfirmDialog(
+                      title = "Khôi phục sticker mẫu?",
+                      message = "Danh sách hiện tại sẽ được thay bằng 10 sticker mẫu.",
+                      confirmLabel = "Khôi phục",
+                      onConfirm = { vm.restoreDefaultStickers() },
+                      onDismiss = { confirmReset = false }
+                  )
+              }
+          }
+
+          @Composable
+          private fun StickerCard(
+              sticker: Sticker,
+              onToggle: (Boolean) -> Unit,
+              onEdit: () -> Unit,
+              onDelete: () -> Unit
+          ) {
+              Card(Modifier.fillMaxWidth()) {
+                  Row(
+                      Modifier
+                          .padding(start = 12.dp, top = 8.dp, bottom = 8.dp, end = 4.dp)
+                          .alpha(if (sticker.enabled) 1f else 0.55f),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Text(sticker.emoji, fontSize = 26.sp)
+                      Column(
+                          Modifier
+                              .weight(1f)
+                              .padding(horizontal = 10.dp)
+                      ) {
+                          Text(
+                              sticker.text,
+                              fontWeight = FontWeight.Bold,
+                              maxLines = 2,
+                              overflow = TextOverflow.Ellipsis
+                          )
+                          Text(
+                              "#${sticker.id} • ${sticker.kind.label}",
+                              style = MaterialTheme.typography.bodySmall,
+                              color = MaterialTheme.colorScheme.onSurfaceVariant
+                          )
+                      }
+                      Switch(checked = sticker.enabled, onCheckedChange = onToggle)
+                      IconButton(onClick = onEdit) {
+                          Icon(Icons.Default.Edit, contentDescription = "Sửa sticker")
+                      }
+                      IconButton(onClick = onDelete) {
+                          Icon(Icons.Default.Delete, contentDescription = "Xóa sticker")
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun StickerDialog(
+              title: String,
+              initial: Sticker?,
+              onDismiss: () -> Unit,
+              onSubmit: (String, String, StickerKind) -> String?
+          ) {
+              var stickerText by remember { mutableStateOf(initial?.text ?: "") }
+              var stickerEmoji by remember { mutableStateOf(initial?.emoji ?: "✨") }
+              var kind by remember { mutableStateOf(initial?.kind ?: StickerKind.FADE) }
+              var error by remember { mutableStateOf<String?>(null) }
+
+              AlertDialog(
+                  onDismissRequest = onDismiss,
+                  title = { Text(title) },
+                  text = {
+                      Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                          OutlinedTextField(
+                              value = stickerEmoji,
+                              onValueChange = {
+                                  stickerEmoji = it.take(Limits.MAX_EMOJI)
+                                  error = null
+                              },
+                              label = { Text("Emoji") },
+                              singleLine = true,
+                              modifier = Modifier.fillMaxWidth()
+                          )
+                          OutlinedTextField(
+                              value = stickerText,
+                              onValueChange = {
+                                  stickerText = it.take(Limits.MAX_STICKER_TEXT)
+                                  error = null
+                              },
+                              label = { Text("Nội dung sticker") },
+                              supportingText = { Text("${stickerText.length}/${Limits.MAX_STICKER_TEXT}") },
+                              isError = error != null,
+                              singleLine = true,
+                              modifier = Modifier.fillMaxWidth()
+                          )
+                          Text("Hiệu ứng", style = MaterialTheme.typography.labelLarge)
+                          Row(
+                              Modifier.horizontalScroll(rememberScrollState()),
+                              horizontalArrangement = Arrangement.spacedBy(8.dp)
+                          ) {
+                              StickerKind.entries.forEach { k ->
+                                  FilterChip(
+                                      selected = k == kind,
+                                      onClick = { kind = k },
+                                      label = { Text(k.label) }
+                                  )
+                              }
+                          }
+                          val message = error
+                          if (message != null) {
+                              Text(message, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                          }
+                      }
+                  },
+                  confirmButton = {
+                      TextButton(onClick = {
+                          val result = onSubmit(stickerText, stickerEmoji, kind)
+                          if (result == null) onDismiss() else error = result
+                      }) { Text("Lưu") }
+                  },
+                  dismissButton = { TextButton(onClick = onDismiss) { Text("Hủy") } }
+              )
+          }
+          LOS_EOF
+          mkdir -p "app/src/main/java/com/example/liveoverlaystudio/ui"
+          cat > "app/src/main/java/com/example/liveoverlaystudio/ui/StudioScreen.kt" <<'LOS_EOF'
+          package com.example.liveoverlaystudio.ui
+
+          import android.content.ActivityNotFoundException
+          import android.net.Uri
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.PaddingValues
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.Close
+          import androidx.compose.material.icons.filled.PlayArrow
+          import androidx.compose.material3.Button
+          import androidx.compose.material3.Card
+          import androidx.compose.material3.FilledTonalButton
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.OutlinedButton
+          import androidx.compose.material3.OutlinedTextField
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.unit.dp
+          import com.example.liveoverlaystudio.model.Limits
+
+          @Composable
+          fun StudioScreen(vm: OverlayViewModel, modifier: Modifier = Modifier) {
+              val pickVideo = rememberLauncherForActivityResult(
+                  ActivityResultContracts.OpenDocument()
+              ) { uri: Uri? ->
+                  if (uri != null) vm.onVideoPicked(uri)
+              }
+
+              LazyColumn(
+                  modifier = modifier
+                      .fillMaxSize()
+                      .padding(horizontal = 16.dp),
+                  verticalArrangement = Arrangement.spacedBy(14.dp),
+                  contentPadding = PaddingValues(vertical = 12.dp)
+              ) {
+                  item {
+                      PreviewPanel(
+                          stickers = vm.stickers,
+                          settings = vm.settings,
+                          ticker = vm.ticker,
+                          running = vm.previewRunning,
+                          frame = vm.videoFrame
+                      )
+                  }
+                  item {
+                      Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                          FilledTonalButton(
+                              onClick = { vm.togglePreview() },
+                              modifier = Modifier.weight(1f)
+                          ) {
+                              Icon(
+                                  if (vm.previewRunning) Icons.Default.Close else Icons.Default.PlayArrow,
+                                  contentDescription = null
+                              )
+                              Spacer(Modifier.width(6.dp))
+                              Text(if (vm.previewRunning) "Dừng" else "Chạy preview")
+                          }
+                          OutlinedButton(
+                              onClick = {
+                                  try {
+                                      pickVideo.launch(arrayOf("video/*"))
+                                  } catch (e: ActivityNotFoundException) {
+                                      vm.showError("Thiết bị không có ứng dụng để chọn tệp video.")
+                                  }
+                              },
+                              modifier = Modifier.weight(1f)
+                          ) { Text("Chọn video") }
+                      }
+                  }
+                  item { VideoCard(vm) }
+                  item { TickerCard(vm) }
+                  item {
+                      Text(
+                          "Lưu ý: ứng dụng chỉ dùng video do bạn sở hữu hoặc được phép sử dụng. " +
+                              "Bản hiện tại là công cụ thiết kế/xem trước overlay: chưa phát livestream, " +
+                              "chưa ghép overlay vào video và không lấy luồng TikTok LIVE.",
+                          style = MaterialTheme.typography.bodySmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          private fun VideoCard(vm: OverlayViewModel) {
+              Card(Modifier.fillMaxWidth()) {
+                  Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                      SectionTitle("Video nền (cục bộ)")
+                      if (vm.videoUri == null) {
+                          Text(
+                              "Chưa chọn video. Bạn có thể chọn video có sẵn trên điện thoại để làm nền xem trước.",
+                              style = MaterialTheme.typography.bodySmall
+                          )
+                      } else {
+                          Text(
+                              "Đã chọn: ${vm.videoName ?: "video"}",
+                              style = MaterialTheme.typography.bodyMedium
+                          )
+                          Text(
+                              "Chỉ hiển thị khung hình đầu tiên, chưa phát video.",
+                              style = MaterialTheme.typography.bodySmall,
+                              color = MaterialTheme.colorScheme.onSurfaceVariant
+                          )
+                          TextButton(onClick = { vm.clearVideo() }) { Text("Bỏ video") }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun TickerCard(vm: OverlayViewModel) {
+              var draft by remember(vm.ticker.text) { mutableStateOf(vm.ticker.text) }
+              var error by remember { mutableStateOf<String?>(null) }
+
+              Card(Modifier.fillMaxWidth()) {
+                  Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                      SectionTitle("Dòng chữ chạy (ticker)")
+                      SettingSwitch("Hiện dòng chữ chạy", vm.ticker.enabled) { vm.setTickerEnabled(it) }
+                      OutlinedTextField(
+                          value = draft,
+                          onValueChange = {
+                              draft = it.take(Limits.MAX_TICKER_TEXT)
+                              error = null
+                          },
+                          label = { Text("Nội dung dòng chữ") },
+                          isError = error != null,
+                          supportingText = { Text(error ?: "${draft.length}/${Limits.MAX_TICKER_TEXT}") },
+                          modifier = Modifier.fillMaxWidth(),
+                          singleLine = true
+                      )
+                      Button(
+                          onClick = { error = vm.setTickerText(draft) },
+                          modifier = Modifier.fillMaxWidth()
+                      ) { Text("Lưu dòng chữ") }
+                  }
+              }
+          }
+          LOS_EOF
+          mkdir -p "app/src/main/java/com/example/liveoverlaystudio/ui"
+          cat > "app/src/main/java/com/example/liveoverlaystudio/ui/Theme.kt" <<'LOS_EOF'
+          package com.example.liveoverlaystudio.ui
+
+          import androidx.compose.foundation.isSystemInDarkTheme
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.darkColorScheme
+          import androidx.compose.material3.lightColorScheme
+          import androidx.compose.runtime.Composable
+          import androidx.compose.ui.graphics.Color
+
+          @Composable
+          fun LiveOverlayTheme(content: @Composable () -> Unit) {
+              val colors = if (isSystemInDarkTheme()) {
+                  darkColorScheme(primary = Color(0xFFD0BCFF))
+              } else {
+                  lightColorScheme(primary = Color(0xFF6750A4))
+              }
+              MaterialTheme(colorScheme = colors, content = content)
+          }
+          LOS_EOF
+          mkdir -p "app/src/main/java/com/example/liveoverlaystudio/video"
+          cat > "app/src/main/java/com/example/liveoverlaystudio/video/LocalVideo.kt" <<'LOS_EOF'
+          package com.example.liveoverlaystudio.video
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.media.MediaMetadataRetriever
+          import android.net.Uri
+          import android.provider.OpenableColumns
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+
+          /**
+           * Module video (tách riêng để phát triển tiếp sau này).
+           *
+           * Hiện tại CHỈ hỗ trợ video cục bộ do người dùng tự chọn trên thiết bị
+           * và CHỈ lấy 1 khung hình đầu tiên làm nền cho vùng xem trước.
+           * Chưa phát video, chưa ghép overlay vào video, chưa phát livestream.
+           */
+          interface VideoSource {
+              suspend fun displayName(context: Context): String
+              suspend fun loadPreviewFrame(context: Context): Result<Bitmap>
+          }
+
+          class LocalVideoSource(private val uri: Uri) : VideoSource {
+
+              override suspend fun displayName(context: Context): String = withContext(Dispatchers.IO) {
+                  var name: String? = null
+                  try {
+                      val cursor = context.contentResolver.query(
+                          uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null
+                      )
+                      if (cursor != null) {
+                          try {
+                              if (cursor.moveToFirst()) {
+                                  val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                                  if (index >= 0) name = cursor.getString(index)
+                              }
+                          } finally {
+                              cursor.close()
+                          }
+                      }
+                  } catch (e: Exception) {
+                      name = null
+                  }
+                  name ?: DEFAULT_NAME
+              }
+
+              override suspend fun loadPreviewFrame(context: Context): Result<Bitmap> =
+                  withContext(Dispatchers.IO) {
+                      val retriever = MediaMetadataRetriever()
+                      try {
+                          retriever.setDataSource(context, uri)
+                          val frame = retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                          if (frame == null) {
+                              Result.failure<Bitmap>(IllegalStateException("không đọc được khung hình"))
+                          } else {
+                              Result.success(downscale(frame))
+                          }
+                      } catch (e: Exception) {
+                          Result.failure<Bitmap>(e)
+                      } catch (e: OutOfMemoryError) {
+                          Result.failure<Bitmap>(IllegalStateException("video quá lớn"))
+                      } finally {
+                          try {
+                              retriever.release()
+                          } catch (e: Exception) {
+                              // bỏ qua lỗi khi giải phóng
+                          }
+                      }
+                  }
+
+              private fun downscale(source: Bitmap): Bitmap {
+                  if (source.width <= TARGET_WIDTH) return source
+                  val height = (source.height.toLong() * TARGET_WIDTH / source.width).toInt().coerceAtLeast(1)
+                  return Bitmap.createScaledBitmap(source, TARGET_WIDTH, height, true)
+              }
+
+              private companion object {
+                  const val DEFAULT_NAME = "Video đã chọn"
+                  const val TARGET_WIDTH = 1280
+              }
+          }
+          LOS_EOF
+          cat > "build.gradle.kts" <<'LOS_EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+          }
+          LOS_EOF
+          cat > "gradle.properties" <<'LOS_EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          kotlin.daemon.jvmargs=-Xmx2g
+          org.gradle.parallel=true
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          LOS_EOF
+          cat > "settings.gradle.kts" <<'LOS_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "LiveOverlayStudio"
+          include(":app")
+          LOS_EOF
+          echo "Da tao xong $(find . -name "*.kt" | wc -l) file Kotlin"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;34.0.0'
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Show tool versions
+        run: |
+          java -version
+          gradle --version
+
+      - name: Build debug APK
+        run: gradle assembleDebug --stacktrace --no-daemon
+
+      - name: Verify APK
+        run: |
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "$APK" ]; then
+            echo "::error title=APK not found::Khong tim thay $APK sau khi build"
+            find app/build/outputs -type f || true
+            exit 1
+          fi
+          ls -l "$APK"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveOverlayStudio-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload build reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveOverlayStudio-build-reports
+          path: |
+            app/build/reports/
+            app/build/outputs/logs/
+          if-no-files-found: ignore
+          retention-days: 7
